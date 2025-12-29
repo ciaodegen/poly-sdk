@@ -41,7 +41,9 @@ export interface RealtimeServiceConfig {
  * Extends the base Orderbook type from core/types.ts.
  */
 export interface OrderbookSnapshot extends Orderbook {
-  /** Token/asset ID (required in WebSocket context) */
+  /** Token ID (ERC-1155 token identifier, required in WebSocket context) */
+  tokenId: string;
+  /** @deprecated Use tokenId instead */
   assetId: string;
   /** Market condition ID (required in WebSocket context) */
   market: string;
@@ -1129,8 +1131,10 @@ export class RealtimeServiceV2 extends EventEmitter {
       .map(l => ({ price: parseFloat(l.price), size: parseFloat(l.size) }))
       .sort((a, b) => a.price - b.price);
 
+    const tokenId = payload.asset_id as string || '';
     return {
-      assetId: payload.asset_id as string || '',
+      tokenId,
+      assetId: tokenId, // Backward compatibility
       market: payload.market as string || '',
       bids,
       asks,

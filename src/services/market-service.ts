@@ -25,6 +25,7 @@ import { RateLimiter, ApiType } from '../core/rate-limiter.js';
 import { PolymarketError, ErrorCode } from '../core/errors.js';
 import type {
   UnifiedMarket,
+  MarketToken as UnifiedMarketToken,
   ProcessedOrderbook,
   EffectivePrices,
   ArbitrageOpportunity,
@@ -95,6 +96,12 @@ interface ClobMarket {
   minimum_tick_size?: number;
 }
 
+/**
+ * CLOB Market type (from CLOB API)
+ *
+ * This represents the raw market data from the CLOB API.
+ * For merged market data with volume/liquidity, use UnifiedMarket from core/types.ts.
+ */
 export interface Market {
   conditionId: string;
   questionId?: string;
@@ -111,6 +118,10 @@ export interface Market {
   minimumTickSize?: number;
 }
 
+/**
+ * Token in a CLOB market
+ * Same structure as MarketToken in core/types.ts
+ */
 export interface MarketToken {
   tokenId: string;
   outcome: string;
@@ -210,11 +221,12 @@ export class MarketService {
         .sort((a, b) => a.price - b.price);
 
       return {
+        tokenId: book.asset_id,
+        assetId: book.asset_id, // Backward compatibility
         bids,
         asks,
         timestamp: parseInt(book.timestamp || '0', 10) || Date.now(),
         market: book.market,
-        assetId: book.asset_id,
         hash: book.hash,
       };
     });
@@ -251,11 +263,12 @@ export class MarketService {
           .sort((a, b) => a.price - b.price);
 
         result.set(book.asset_id, {
+          tokenId: book.asset_id,
+          assetId: book.asset_id, // Backward compatibility
           bids,
           asks,
           timestamp: parseInt(book.timestamp || '0', 10) || Date.now(),
           market: book.market,
-          assetId: book.asset_id,
           hash: book.hash,
         });
       }
@@ -894,18 +907,20 @@ export class MarketService {
   }
 
   private mergeMarkets(gamma: GammaMarket, clob: Market): UnifiedMarket {
-    const yesToken = clob.tokens.find((t) => t.outcome === 'Yes');
-    const noToken = clob.tokens.find((t) => t.outcome === 'No');
+    // Build tokens array from CLOB data, falling back to Gamma prices
+    const tokens: UnifiedMarketToken[] = clob.tokens.map((t, index) => ({
+      tokenId: t.tokenId,
+      outcome: t.outcome,
+      price: t.price || gamma.outcomePrices[index] || 0.5,
+      winner: t.winner,
+    }));
 
     return {
       conditionId: clob.conditionId,
       slug: gamma.slug,
       question: clob.question,
       description: clob.description || gamma.description,
-      tokens: {
-        yes: { tokenId: yesToken?.tokenId || '', price: yesToken?.price || gamma.outcomePrices[0] || 0.5 },
-        no: { tokenId: noToken?.tokenId || '', price: noToken?.price || gamma.outcomePrices[1] || 0.5 },
-      },
+      tokens,
       volume: gamma.volume,
       volume24hr: gamma.volume24hr,
       liquidity: gamma.liquidity,
@@ -921,15 +936,18 @@ export class MarketService {
   }
 
   private fromGammaMarket(gamma: GammaMarket): UnifiedMarket {
+    // Create tokens from Gamma outcomes (binary market: Yes/No)
+    const tokens: UnifiedMarketToken[] = [
+      { tokenId: '', outcome: 'Yes', price: gamma.outcomePrices[0] || 0.5 },
+      { tokenId: '', outcome: 'No', price: gamma.outcomePrices[1] || 0.5 },
+    ];
+
     return {
       conditionId: gamma.conditionId,
       slug: gamma.slug,
       question: gamma.question,
       description: gamma.description,
-      tokens: {
-        yes: { tokenId: '', price: gamma.outcomePrices[0] || 0.5 },
-        no: { tokenId: '', price: gamma.outcomePrices[1] || 0.5 },
-      },
+      tokens,
       volume: gamma.volume,
       volume24hr: gamma.volume24hr,
       liquidity: gamma.liquidity,
@@ -945,18 +963,20 @@ export class MarketService {
   }
 
   private fromClobMarket(clob: Market): UnifiedMarket {
-    const yesToken = clob.tokens.find((t) => t.outcome === 'Yes');
-    const noToken = clob.tokens.find((t) => t.outcome === 'No');
+    // Convert CLOB tokens to UnifiedMarketToken format
+    const tokens: UnifiedMarketToken[] = clob.tokens.map(t => ({
+      tokenId: t.tokenId,
+      outcome: t.outcome,
+      price: t.price,
+      winner: t.winner,
+    }));
 
     return {
       conditionId: clob.conditionId,
       slug: clob.marketSlug,
       question: clob.question,
       description: clob.description,
-      tokens: {
-        yes: { tokenId: yesToken?.tokenId || '', price: yesToken?.price || 0.5 },
-        no: { tokenId: noToken?.tokenId || '', price: noToken?.price || 0.5 },
-      },
+      tokens,
       volume: 0,
       volume24hr: undefined,
       liquidity: 0,
