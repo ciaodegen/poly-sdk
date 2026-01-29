@@ -222,6 +222,28 @@ export type {
   DipArbLegInfo,
 } from './services/dip-arb-types.js';
 
+// SnipeService - Market close sniping strategy
+export { SnipeService } from './services/snipe-service.js';
+export type {
+  SnipeServiceConfig,
+  SnipeMarketConfig,
+  SnipeTradeState,
+  SnipeStats,
+  SnipeSignal,
+  SnipeEntrySignal,
+  SnipeExitSignal,
+  SnipeExecutionResult,
+  SnipeTradeResult,
+  SnipeWindowOpenEvent,
+  SnipeRewardsTrackedEvent,
+  SnipeScanOptions,
+  SnipePhase,
+  SnipeTokenSide,
+  SnipePositionInfo,
+  SnipeExitInfo,
+  SnipeRewardsInfo,
+} from './services/snipe-types.js';
+
 // BinanceService - BTC/ETH/SOL K-line data from Binance
 export { BinanceService } from './services/binance-service.js';
 export type {
@@ -389,6 +411,7 @@ import { RealtimeServiceV2 } from './services/realtime-service-v2.js';
 import { SmartMoneyService } from './services/smart-money-service.js';
 import { BinanceService } from './services/binance-service.js';
 import { DipArbService } from './services/dip-arb-service.js';
+import { SnipeService } from './services/snipe-service.js';
 import type { UnifiedMarket, ProcessedOrderbook, ArbitrageOpportunity, KLineInterval, KLineCandle, DualKLineData, PolySDKOptions } from './core/types.js';
 import { createUnifiedCache, type UnifiedCache } from './core/unified-cache.js';
 
@@ -413,6 +436,7 @@ export class PolymarketSDK {
   public readonly smartMoney: SmartMoneyService;
   public readonly binance: BinanceService;
   public readonly dipArb: DipArbService;
+  public readonly snipe: SnipeService;
 
   // Initialization state
   private _initialized = false;
@@ -458,6 +482,13 @@ export class PolymarketSDK {
       this.markets,
       config.privateKey,
       config.chainId
+    );
+
+    // Initialize SnipeService
+    this.snipe = new SnipeService(
+      this.realtime,
+      this.tradingService,
+      this.markets
     );
   }
 
@@ -546,6 +577,7 @@ export class PolymarketSDK {
    * Stop SDK - disconnect all services and clean up
    */
   stop(): void {
+    this.snipe.stop();
     this.dipArb.stop();
     this.smartMoney.disconnect();
     this.realtime.disconnect();

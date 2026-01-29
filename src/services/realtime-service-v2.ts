@@ -14,6 +14,7 @@
  */
 
 import { EventEmitter } from 'events';
+import WebSocket from 'ws';
 import {
   RealTimeDataClient,
   type Message,
@@ -21,6 +22,9 @@ import {
   ConnectionStatus,
 } from '@polymarket/real-time-data-client';
 import type { PriceUpdate, BookUpdate, Orderbook, OrderbookLevel } from '../core/types.js';
+
+// CLOB WebSocket endpoint for orderbook data
+const CLOB_WS_MARKET_ENDPOINT = 'wss://ws-subscriptions-clob.polymarket.com/ws/market';
 
 // ============================================================================
 // Types
@@ -259,6 +263,13 @@ export class RealtimeServiceV2 extends EventEmitter {
   private subscriptionIdCounter = 0;
   private connected = false;
 
+  // CLOB WebSocket for orderbook data (separate from RTDS)
+  private clobWs: WebSocket | null = null;
+  private clobConnected = false;
+  private clobSubscribedTokens: Set<string> = new Set();
+  private clobReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private clobPingInterval: ReturnType<typeof setInterval> | null = null;
+
   // Store subscription messages for reconnection
   private subscriptionMessages: Map<string, { subscriptions: Array<{ topic: string; type: string; filters?: string; clob_auth?: ClobApiKeyCreds }> }> = new Map();
 
@@ -305,50 +316,266 @@ export class RealtimeServiceV2 extends EventEmitter {
    * Disconnect from WebSocket server
    */
   disconnect(): void {
+    // Disconnect RTDS client
     if (this.client) {
       this.client.disconnect();
       this.client = null;
       this.connected = false;
       this.subscriptions.clear();
-      this.subscriptionMessages.clear();  // Clear reconnection list
+      this.subscriptionMessages.clear();
     }
+
+    // Disconnect CLOB WebSocket
+    this.disconnectClobWs();
   }
 
   /**
    * Check if connected
    */
   isConnected(): boolean {
-    return this.connected;
+    return this.connected || this.clobConnected;
   }
 
   // ============================================================================
-  // Market Data Subscriptions (clob_market)
+  // CLOB WebSocket Management (for orderbook data)
+  // ============================================================================
+
+  /**
+   * Connect to CLOB WebSocket for orderbook data
+   */
+  private connectClobWs(): void {
+    if (this.clobWs) {
+      return; // Already connected
+    }
+
+    this.log('Connecting to CLOB WebSocket...');
+
+    this.clobWs = new WebSocket(CLOB_WS_MARKET_ENDPOINT);
+
+    this.clobWs.on('open', () => {
+      this.log('CLOB WebSocket connected');
+      this.clobConnected = true;
+
+      // Start ping interval
+      this.clobPingInterval = setInterval(() => {
+        if (this.clobWs?.readyState === WebSocket.OPEN) {
+          this.clobWs.ping();
+        }
+      }, 30000);
+
+      // Re-subscribe to existing tokens
+      if (this.clobSubscribedTokens.size > 0) {
+        this.sendClobSubscription(Array.from(this.clobSubscribedTokens));
+      }
+
+      this.emit('clobConnected');
+    });
+
+    this.clobWs.on('message', (data: WebSocket.Data) => {
+      try {
+        const message = JSON.parse(data.toString());
+        this.handleClobMessage(message);
+      } catch (err) {
+        this.log(`CLOB message parse error: ${err}`);
+      }
+    });
+
+    this.clobWs.on('close', () => {
+      this.log('CLOB WebSocket disconnected');
+      this.clobConnected = false;
+      this.clobWs = null;
+
+      if (this.clobPingInterval) {
+        clearInterval(this.clobPingInterval);
+        this.clobPingInterval = null;
+      }
+
+      // Auto-reconnect if we have subscriptions
+      if (this.config.autoReconnect && this.clobSubscribedTokens.size > 0) {
+        this.clobReconnectTimer = setTimeout(() => {
+          this.log('CLOB WebSocket reconnecting...');
+          this.connectClobWs();
+        }, 3000);
+      }
+
+      this.emit('clobDisconnected');
+    });
+
+    this.clobWs.on('error', (err) => {
+      this.log(`CLOB WebSocket error: ${err.message}`);
+      this.emit('error', err);
+    });
+  }
+
+  /**
+   * Disconnect CLOB WebSocket
+   */
+  private disconnectClobWs(): void {
+    if (this.clobReconnectTimer) {
+      clearTimeout(this.clobReconnectTimer);
+      this.clobReconnectTimer = null;
+    }
+
+    if (this.clobPingInterval) {
+      clearInterval(this.clobPingInterval);
+      this.clobPingInterval = null;
+    }
+
+    if (this.clobWs) {
+      this.clobWs.close();
+      this.clobWs = null;
+      this.clobConnected = false;
+    }
+
+    this.clobSubscribedTokens.clear();
+  }
+
+  /**
+   * Send subscription to CLOB WebSocket
+   */
+  private sendClobSubscription(tokenIds: string[]): void {
+    if (!this.clobWs || this.clobWs.readyState !== WebSocket.OPEN) {
+      this.log('CLOB WebSocket not connected, queuing subscription');
+      return;
+    }
+
+    const message = {
+      type: 'market',
+      assets_ids: tokenIds,
+    };
+
+    this.log(`CLOB subscribing to ${tokenIds.length} tokens`);
+    this.clobWs.send(JSON.stringify(message));
+  }
+
+  /**
+   * Handle incoming CLOB WebSocket message
+   */
+  private handleClobMessage(message: any): void {
+    // CLOB WebSocket sends array of orderbook updates
+    if (Array.isArray(message)) {
+      for (const item of message) {
+        this.processClobOrderbookUpdate(item);
+      }
+    } else if (message.event_type === 'book') {
+      // Single orderbook update
+      this.processClobOrderbookUpdate(message);
+    } else if (message.event_type === 'last_trade_price') {
+      // Last trade update
+      this.processClobLastTradeUpdate(message);
+    } else if (message.event_type === 'price_change') {
+      // Price change update
+      this.processClobPriceChangeUpdate(message);
+    } else {
+      this.log(`CLOB unknown message type: ${JSON.stringify(message).slice(0, 200)}`);
+    }
+  }
+
+  /**
+   * Process CLOB orderbook update
+   */
+  private processClobOrderbookUpdate(data: any): void {
+    const assetId = data.asset_id || data.market;
+    if (!assetId) return;
+
+    // Parse bids and asks
+    const bids: OrderbookLevel[] = [];
+    const asks: OrderbookLevel[] = [];
+
+    if (data.bids && Array.isArray(data.bids)) {
+      for (const bid of data.bids) {
+        bids.push({
+          price: parseFloat(bid.price || bid[0] || '0'),
+          size: parseFloat(bid.size || bid[1] || '0'),
+        });
+      }
+    }
+
+    if (data.asks && Array.isArray(data.asks)) {
+      for (const ask of data.asks) {
+        asks.push({
+          price: parseFloat(ask.price || ask[0] || '0'),
+          size: parseFloat(ask.size || ask[1] || '0'),
+        });
+      }
+    }
+
+    const book: OrderbookSnapshot = {
+      tokenId: assetId,
+      assetId: assetId,
+      market: data.market || '',
+      bids,
+      asks,
+      timestamp: data.timestamp || Date.now(),
+      tickSize: data.min_tick_size || '0.01',
+      minOrderSize: data.min_order_size || '1',
+      hash: data.hash || '',
+    };
+
+    this.bookCache.set(assetId, book);
+    this.emit('orderbook', book);
+  }
+
+  /**
+   * Process CLOB last trade update
+   */
+  private processClobLastTradeUpdate(data: any): void {
+    const trade: LastTradeInfo = {
+      assetId: data.asset_id || '',
+      price: parseFloat(data.price || '0'),
+      side: data.side || 'BUY',
+      size: parseFloat(data.size || '0'),
+      timestamp: data.timestamp || Date.now(),
+    };
+
+    this.lastTradeCache.set(trade.assetId, trade);
+    this.emit('lastTrade', trade);
+  }
+
+  /**
+   * Process CLOB price change update
+   */
+  private processClobPriceChangeUpdate(data: any): void {
+    const change: PriceChange = {
+      assetId: data.asset_id || '',
+      changes: data.changes || [],
+      timestamp: data.timestamp || Date.now(),
+    };
+
+    this.emit('priceChange', change);
+  }
+
+  // ============================================================================
+  // Market Data Subscriptions (using CLOB WebSocket)
   // ============================================================================
 
   /**
    * Subscribe to market data (orderbook, prices, trades)
+   * Uses dedicated CLOB WebSocket for orderbook data
    * @param tokenIds - Array of token IDs to subscribe to
    * @param handlers - Event handlers
    */
   subscribeMarkets(tokenIds: string[], handlers: MarketDataHandlers = {}): MarketSubscription {
     const subId = `market_${++this.subscriptionIdCounter}`;
-    const filterStr = JSON.stringify(tokenIds);
 
-    // Subscribe to all market data types
-    const subscriptions = [
-      { topic: 'clob_market', type: 'agg_orderbook', filters: filterStr },
-      { topic: 'clob_market', type: 'price_change', filters: filterStr },
-      { topic: 'clob_market', type: 'last_trade_price', filters: filterStr },
-      { topic: 'clob_market', type: 'tick_size_change', filters: filterStr },
-    ];
+    // Connect to CLOB WebSocket if not connected
+    if (!this.clobWs) {
+      this.connectClobWs();
+    }
 
-    const subMsg = { subscriptions };
-    this.sendSubscription(subMsg);
-    this.subscriptionMessages.set(subId, subMsg);  // Store for reconnection
+    // Add tokens to subscription set
+    for (const tokenId of tokenIds) {
+      this.clobSubscribedTokens.add(tokenId);
+    }
+
+    // Send subscription when connected
+    if (this.clobConnected) {
+      this.sendClobSubscription(tokenIds);
+    }
 
     // Register handlers
     const orderbookHandler = (book: OrderbookSnapshot) => {
-      if (tokenIds.includes(book.assetId)) {
+      if (tokenIds.includes(book.assetId) || tokenIds.includes(book.tokenId)) {
         handlers.onOrderbook?.(book);
       }
     };
@@ -376,6 +603,9 @@ export class RealtimeServiceV2 extends EventEmitter {
     this.on('lastTrade', lastTradeHandler);
     this.on('tickSizeChange', tickSizeHandler);
 
+    // Note: clobConnected handler in connectClobWs already resubscribes all tokens
+    // No need to add another handler here
+
     const subscription: MarketSubscription = {
       id: subId,
       topic: 'clob_market',
@@ -386,9 +616,18 @@ export class RealtimeServiceV2 extends EventEmitter {
         this.off('priceChange', priceChangeHandler);
         this.off('lastTrade', lastTradeHandler);
         this.off('tickSizeChange', tickSizeHandler);
-        this.sendUnsubscription({ subscriptions });
+
+        // Remove tokens from subscription set
+        for (const tokenId of tokenIds) {
+          this.clobSubscribedTokens.delete(tokenId);
+        }
+
         this.subscriptions.delete(subId);
-        this.subscriptionMessages.delete(subId);  // Remove from reconnection list
+
+        // Disconnect CLOB if no more subscriptions
+        if (this.clobSubscribedTokens.size === 0) {
+          this.disconnectClobWs();
+        }
       },
     };
 
